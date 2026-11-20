@@ -39,7 +39,7 @@ impl Winter {
                 0.0
             }
     }
-    pub unsafe fn draw(&mut self, dc: HDC, width: i32, height: i32) {
+    pub unsafe fn draw(&mut self, dc: HDC, width: i32, height: i32, count: u16) {
         let t = self.time();
         for x in 0..W {
             let u = x as f32 / W as f32;
@@ -83,7 +83,7 @@ impl Winter {
         let colors = [rgb(102, 133, 137), rgb(164, 192, 194), rgb(220, 239, 235)];
         let brushes = colors.map(|c| CreateSolidBrush(c));
         let original = SelectObject(dc, GetStockObject(NULL_PEN));
-        for i in 0..180 {
+        for i in 0..usize::from(count.min(240)) {
             let depth = (i % 3) as f32;
             let seed = i as f32 * 2.39996;
             let x = 210.0

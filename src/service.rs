@@ -201,6 +201,26 @@ unsafe fn owned(h: &Handle) -> Result<(), String> {
 pub struct Service {
     handle: Handle,
 }
+fn named_running(name: &str) -> Result<bool, String> {
+    unsafe {
+        let m = manager(SC_MANAGER_CONNECT)?;
+        let h = OpenServiceW(m.0, wide(name).as_ptr(), SERVICE_QUERY_STATUS);
+        if h.is_null() {
+            return if GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST {
+                Ok(false)
+            } else {
+                Err(error("Проверка службы"))
+            };
+        }
+        Ok(state(&Handle(h))?.dwCurrentState != SERVICE_STOPPED)
+    }
+}
+pub fn external_running() -> Result<bool, String> {
+    named_running("zapret")
+}
+pub fn own_running() -> Result<bool, String> {
+    named_running(NAME)
+}
 impl Service {
     pub fn start(root: &Path, args: &[String]) -> Result<Self, String> {
         unsafe {

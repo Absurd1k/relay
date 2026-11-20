@@ -1,5 +1,6 @@
 pub mod ai;
 pub mod bundle;
+pub mod diagnostics;
 pub mod engine;
 pub mod platform;
 #[cfg(windows)]
@@ -25,6 +26,8 @@ pub struct Settings {
     pub resume_ai: bool,
     pub auto_update: bool,
     pub winter_animation: bool,
+    pub snow_count: u16,
+    pub animation_fps: u16,
 }
 
 impl Default for Settings {
@@ -44,12 +47,17 @@ impl Default for Settings {
             resume_ai: false,
             auto_update: true,
             winter_animation: true,
+            snow_count: 180,
+            animation_fps: 30,
         }
     }
 }
 
 impl Settings {
     pub fn validate(&self) -> Result<(), String> {
+        if self.snow_count > 240 || !(15..=60).contains(&self.animation_fps) {
+            return Err("Некорректные настройки анимации".into());
+        }
         if self.port < 1024 {
             return Err("Выберите порт от 1024 до 65535".into());
         }
@@ -201,6 +209,23 @@ mod tests {
         assert_eq!(strategy_number("general (ALT).bat"), Some(1));
         assert_eq!(strategy_number("general (ALT13).bat"), Some(13));
         assert_eq!(strategy_label("general (ALT11).bat"), "ALT 11");
+    }
+    #[test]
+    fn animation_preferences_round_trip_and_reject_excessive_load() {
+        let mut settings = Settings {
+            snow_count: 0,
+            animation_fps: 60,
+            ..Settings::default()
+        };
+        assert!(settings.validate().is_ok());
+        let loaded: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!((loaded.snow_count, loaded.animation_fps), (0, 60));
+        settings.snow_count = 241;
+        assert!(settings.validate().is_err());
+        settings.snow_count = 180;
+        settings.animation_fps = 1000;
+        assert!(settings.validate().is_err());
     }
     #[test]
     fn restore_plan_preserves_only_explicit_service_states() {

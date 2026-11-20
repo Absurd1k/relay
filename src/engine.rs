@@ -38,6 +38,9 @@ pub enum Action {
     Startup(Settings),
     AutoUpdates(bool),
     CheckUpdate,
+    AutoAlt(Settings),
+    Diagnose(u16, bool),
+    SwitchAlt(Settings, Settings),
 }
 pub enum Event {
     Ready(Result<(PathBuf, Vec<String>), String>),
@@ -47,6 +50,13 @@ pub enum Event {
     Memory(f64),
     Startup(Result<Settings, String>),
     Update(crate::updates::Status),
+    Diagnostics(Vec<crate::diagnostics::Finding>),
+    Profile(Result<Settings, String>),
+    AltProgress(String),
+    AltDone {
+        result: Result<Option<String>, String>,
+        running: bool,
+    },
 }
 #[derive(Clone)]
 pub struct Check {
@@ -57,6 +67,7 @@ pub struct Check {
 }
 
 pub struct Backend {
+    pub cancel_alt: Arc<AtomicBool>,
     pub tx: SyncSender<Action>,
     pub rx: Receiver<Event>,
     handle: Option<thread::JoinHandle<()>>,
@@ -66,6 +77,8 @@ impl Backend {
         let (tx, commands) = mpsc::sync_channel(16);
         let (events, rx) = mpsc::sync_channel(256);
         let repaint = std::sync::Arc::new(repaint);
+        let cancel_alt = Arc::new(AtomicBool::new(false));
+        let cancelled = cancel_alt.clone();
         let handle = thread::spawn(move || {
             let mut manager = Manager::new(data, events.clone());
             let ready = manager.prepare();
@@ -73,8 +86,6 @@ impl Backend {
             repaint();
             let mut last_memory = Instant::now();
             let update_busy = Arc::new(AtomicBool::new(false));
-            let mut auto_updates = false;
-            let mut next_update = Instant::now();
             loop {
                 match commands.recv_timeout(Duration::from_millis(500)) {
                     Ok(Action::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -94,9 +105,52 @@ impl Backend {
                         let _ = events.send(Event::Startup(result));
                         repaint();
                     }
+                    Ok(Action::AutoAlt(settings)) => {
+                        let result = manager.auto_alt(settings, &cancelled, &*repaint);
+                        let running = manager.service.as_ref().is_some_and(|s| s.running());
+                        let _ = events.send(Event::AltDone { result, running });
+                        repaint();
+                    }
+                    Ok(Action::SwitchAlt(previous, next)) => {
+                        let result = (|| {
+                            if let Some(service) = manager.service.as_mut() {
+                                service.stop()?;
+                            }
+                            manager.service = None;
+                            if let Err(e) = manager.start(Kind::Zapret, next.clone()) {
+                                return match manager.start(Kind::Zapret, previous) {
+                                    Ok(()) => Err(format!(
+                                        "Новый ALT не запущен, прежний восстановлен: {e}"
+                                    )),
+                                    Err(restore) => Err(format!(
+                                        "Новый ALT не запущен: {e}. Восстановление: {restore}"
+                                    )),
+                                };
+                            }
+                            Ok(next)
+                        })();
+                        let _ = events.send(Event::Profile(result));
+                        repaint();
+                    }
+                    Ok(Action::Diagnose(port, tg)) => {
+                        let sender = events.clone();
+                        let wake = repaint.clone();
+                        thread::spawn(move || {
+                            let _ =
+                                sender.send(Event::Diagnostics(crate::diagnostics::run(port, tg)));
+                            wake();
+                        });
+                    }
                     Ok(Action::AutoUpdates(enabled)) => {
-                        auto_updates = enabled;
-                        next_update = Instant::now();
+                        if enabled {
+                            spawn_update(
+                                manager.data.clone(),
+                                true,
+                                events.clone(),
+                                repaint.clone(),
+                                update_busy.clone(),
+                            );
+                        }
                     }
                     Ok(Action::CheckUpdate) => {
                         spawn_update(
@@ -120,16 +174,6 @@ impl Backend {
                 }
                 if manager.poll() {
                     repaint();
-                }
-                if auto_updates && Instant::now() >= next_update {
-                    next_update = Instant::now() + crate::updates::INTERVAL;
-                    spawn_update(
-                        manager.data.clone(),
-                        false,
-                        events.clone(),
-                        repaint.clone(),
-                        update_busy.clone(),
-                    );
                 }
                 if last_memory.elapsed() >= Duration::from_secs(5) {
                     let total = platform::memory_mb(std::process::id()).unwrap_or(0.0)
@@ -156,6 +200,7 @@ impl Backend {
             manager.stop(Kind::Ai);
         });
         Self {
+            cancel_alt,
             tx,
             rx,
             handle: Some(handle),
@@ -169,6 +214,7 @@ impl Backend {
 }
 impl Drop for Backend {
     fn drop(&mut self) {
+        self.cancel_alt.store(true, Ordering::Relaxed);
         let _ = self.tx.send(Action::Shutdown);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -187,6 +233,92 @@ struct Manager {
     service: Option<crate::service::Service>,
 }
 impl Manager {
+    #[cfg(windows)]
+    fn auto_alt(
+        &mut self,
+        settings: Settings,
+        cancelled: &AtomicBool,
+        wake: &dyn Fn(),
+    ) -> Result<Option<String>, String> {
+        if !platform::is_admin() {
+            return Err("Для подбора ALT перезапустите Relay с правами администратора.".into());
+        }
+        if crate::service::external_running()? {
+            return Err(
+                "Работает отдельная служба zapret. Сначала остановите её самостоятельно.".into(),
+            );
+        }
+        let was_running = self.service.as_ref().is_some_and(|s| s.running());
+        let profiles: Vec<String> = std::fs::read_dir(
+            self.root
+                .as_ref()
+                .ok_or("Компоненты ещё не готовы")?
+                .join("zapret"),
+        )
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|s| safe_strategy(s))
+        .collect();
+        let mut profiles = profiles;
+        profiles.sort_by_key(|s| crate::strategy_number(s));
+        let attempt = pick_profile(&profiles, cancelled, |index, profile| {
+            if let Some(service) = self.service.as_mut() {
+                service.stop()?;
+            }
+            self.service = None;
+            let _ = self.events.send(Event::AltProgress(format!(
+                "Проверка {} · {}/{}",
+                crate::strategy_label(profile),
+                index + 1,
+                profiles.len()
+            )));
+            wake();
+            let mut candidate = settings.clone();
+            candidate.strategy = profile.clone();
+            if let Err(e) = self.start(Kind::Zapret, candidate) {
+                let _ = self.events.try_send(Event::Log(e));
+                return Ok(false);
+            }
+            for _ in 0..5 {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Ok(false);
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            let checks = check_targets(
+                &[
+                    ("Discord API", "https://discord.com/api/v10/gateway"),
+                    ("YouTube", "https://www.youtube.com/generate_204"),
+                ],
+                Duration::from_secs(6),
+            );
+            let works = checks.len() == 2 && checks.iter().all(|c| c.ok);
+            for check in &checks {
+                let _ = self.events.try_send(Event::Log(format!(
+                    "{} · {}: {} · {} мс",
+                    crate::strategy_label(profile),
+                    check.name,
+                    check.detail,
+                    check.ms
+                )));
+            }
+            let _ = self.events.send(Event::Checks(checks));
+            wake();
+            Ok(works && self.service.as_ref().is_some_and(|s| s.running()))
+        });
+        if !matches!(&attempt, Ok(Some(_))) {
+            if let Some(service) = self.service.as_mut() {
+                service.stop()?;
+            }
+            self.service = None;
+            if was_running {
+                self.start(Kind::Zapret, settings)
+                    .map_err(|e| format!("Не удалось вернуть прежнее подключение: {e}"))?;
+            }
+        }
+        attempt
+    }
     fn new(data: PathBuf, events: SyncSender<Event>) -> Self {
         Self {
             data,
@@ -267,6 +399,8 @@ impl Manager {
                     return Ok(());
                 }
                 let root = self.root.as_ref().ok_or("Компоненты ещё не готовы")?;
+                let manifest = serde_json::from_str(bundle::MANIFEST).map_err(|e| e.to_string())?;
+                bundle::verify(root, &manifest)?;
                 let dir = crate::service::prepare_files(root)?;
                 let script = std::fs::read_to_string(root.join("zapret").join(&settings.strategy))
                     .map_err(|e| e.to_string())?;
@@ -570,18 +704,43 @@ pub fn parse_strategy(script: &str, dir: &Path) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+fn pick_profile(
+    profiles: &[String],
+    cancelled: &AtomicBool,
+    mut probe: impl FnMut(usize, &String) -> Result<bool, String>,
+) -> Result<Option<String>, String> {
+    for (index, profile) in profiles.iter().enumerate() {
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let works = probe(index, profile)?;
+        if cancelled.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        if works {
+            return Ok(Some(profile.clone()));
+        }
+    }
+    Err("Ни один ALT не прошёл обе HTTPS-проверки. Прежний профиль восстановлен.".into())
+}
+
 fn check_services() -> Vec<Check> {
     let targets = [
         ("Telegram Web", "https://web.telegram.org/"),
         ("Discord API", "https://discord.com/api/v10/gateway"),
         ("YouTube", "https://www.youtube.com/generate_204"),
     ];
+    check_targets(&targets, Duration::from_secs(10))
+}
+fn check_targets(targets: &[(&'static str, &'static str)], timeout: Duration) -> Vec<Check> {
     let handles: Vec<_> = targets
-        .into_iter()
+        .iter()
+        .copied()
         .map(|(name, url)| {
             thread::spawn(move || {
                 let agent: ureq::Agent = ureq::Agent::config_builder()
-                    .timeout_global(Some(Duration::from_secs(10)))
+                    .timeout_global(Some(timeout))
+                    .proxy(None)
                     .build()
                     .into();
                 let start = Instant::now();
@@ -616,6 +775,36 @@ pub fn push_log(log: &mut VecDeque<String>, text: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn alt_search_stops_at_first_success_and_honours_cancellation() {
+        let profiles = vec!["ALT 1".into(), "ALT 2".into(), "ALT 3".into()];
+        let cancel = AtomicBool::new(false);
+        let mut visited = vec![];
+        let result = pick_profile(&profiles, &cancel, |i, _| {
+            visited.push(i);
+            Ok(i == 1)
+        })
+        .unwrap();
+        assert_eq!(result, Some("ALT 2".into()));
+        assert_eq!(visited, vec![0, 1]);
+        assert_eq!(
+            pick_profile(&profiles, &cancel, |_, _| {
+                cancel.store(true, Ordering::Relaxed);
+                Ok(true)
+            })
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            pick_profile(&profiles, &cancel, |_, _| panic!(
+                "cancelled search must not probe"
+            ))
+            .unwrap(),
+            None
+        );
+        cancel.store(false, Ordering::Relaxed);
+        assert!(pick_profile(&profiles, &cancel, |_, _| Ok(false)).is_err());
+    }
     #[test]
     fn parse_preserves_paths_with_spaces_without_shell_execution() {
         let src = "@echo off\nstart \"x\" /min \"%BIN%winws.exe\" --wf-tcp=443,%GameFilterTCP% ^\n--hostlist=\"%LISTS%list-general.txt\" --new";

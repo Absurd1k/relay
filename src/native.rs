@@ -23,6 +23,8 @@ use windows_sys::Win32::{
 
 const TRAY_MESSAGE: u32 = WM_APP + 2;
 const SHOW_MESSAGE: u32 = WM_APP + 3;
+// TBM_GETPOS is WM_USER in commctrl.h; windows-sys omits this zero-offset alias.
+const TBM_GETPOS: u32 = WM_USER;
 
 const fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | (g << 8) | (b << 16)
@@ -86,6 +88,11 @@ struct App {
     update_busy: bool,
     install_pending: bool,
     close_after_service: bool,
+    alt_busy: bool,
+    diagnosing: bool,
+    show_diagnostics: bool,
+    findings: Vec<relay::diagnostics::Finding>,
+    sliders: [HWND; 2],
 }
 impl App {
     fn new(icon: HICON, hero_icon: HICON, tray_icon: HICON) -> Self {
@@ -129,11 +136,16 @@ impl App {
             winter: crate::winter::Winter::new(),
             surface: None,
             animation_timer: false,
-            update_status: "Проверка GitHub каждые 30 минут".into(),
+            update_status: "Проверка GitHub только при запуске".into(),
             update_ready: None,
             update_busy: false,
             install_pending: false,
             close_after_service: false,
+            alt_busy: false,
+            diagnosing: false,
+            show_diagnostics: false,
+            findings: vec![],
+            sliders: [null_mut(); 2],
         }
     }
     fn notify(&mut self, s: String, error: bool) {
@@ -224,6 +236,55 @@ impl App {
             let Some(event) = event else { break };
             changed = true;
             match event {
+                Event::Profile(result) => {
+                    self.busy[1] = false;
+                    match result {
+                        Ok(settings) => {
+                            self.settings = settings;
+                            if self.save() {
+                                self.notify(
+                                    format!(
+                                        "Включён {}",
+                                        relay::strategy_label(&self.settings.strategy)
+                                    ),
+                                    false,
+                                );
+                            }
+                        }
+                        Err(e) => self.notify(e, true),
+                    }
+                }
+                Event::Diagnostics(findings) => {
+                    self.findings = findings;
+                    self.diagnosing = false;
+                    self.notify(
+                        "Диагностика завершена. Системные настройки не изменялись.".into(),
+                        false,
+                    );
+                }
+                Event::AltProgress(message) => {
+                    engine::push_log(&mut self.logs, message.clone());
+                    self.notify(message, false);
+                }
+                Event::AltDone { result, running } => {
+                    self.alt_busy = false;
+                    self.running[1] = running;
+                    self.busy[1] = false;
+                    match result {
+                        Ok(Some(profile)) => {
+                            self.settings.strategy = profile;
+                            self.settings.resume_zapret = running;
+                            if self.save() {
+                                self.notify(format!("{} прошёл HTTPS-проверки. Голос и видео проверьте в приложениях.",relay::strategy_label(&self.settings.strategy)),false);
+                            }
+                        }
+                        Ok(None) => self.notify(
+                            "Подбор отменён. Прежний профиль и подключение восстановлены.".into(),
+                            false,
+                        ),
+                        Err(e) => self.notify(e, true),
+                    }
+                }
                 Event::Ready(r) => match r {
                     Ok((_, s)) => {
                         self.strategies = s;
@@ -351,13 +412,70 @@ impl App {
         changed
     }
     unsafe fn action(&mut self, id: u32) {
+        if self.alt_busy && matches!(id,1|10..=11|13|16|20..=21|60..=61|71|83|90|2000..=2999) {
+            self.notify("Дождитесь подбора ALT или нажмите «Отменить».".into(), true);
+            return;
+        }
         match id {
-            100..=106 => {
+            100..=107 => {
                 self.page = (id - 100) as usize;
                 ShowWindow(
                     self.port_edit,
                     if self.page == 3 { SW_SHOW } else { SW_HIDE },
                 );
+                for slider in self.sliders {
+                    ShowWindow(slider, if self.page == 6 { SW_SHOW } else { SW_HIDE });
+                }
+            }
+            2000..=2999 => {
+                if let Some(profile) = self.strategies.get((id - 2000) as usize).cloned() {
+                    self.apply_profile(profile);
+                }
+            }
+            90 => {
+                if !self.ready || self.busy.iter().any(|b| *b) || self.startup_busy {
+                    return;
+                }
+                if !self.admin {
+                    self.notify("Подбор ALT требует прав администратора.".into(), true);
+                    return;
+                }
+                if let Some(backend) = &self.backend {
+                    backend
+                        .cancel_alt
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+                if self.send(Action::AutoAlt(self.settings.clone())) {
+                    self.alt_busy = true;
+                    self.busy[1] = true;
+                    self.show_diagnostics = false;
+                    self.notify(
+                        "Подбор ALT: соединение Discord / YouTube может кратко прерываться.".into(),
+                        false,
+                    );
+                }
+            }
+            91 => {
+                if let Some(backend) = &self.backend {
+                    backend
+                        .cancel_alt
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                self.notify("Отмена после завершения текущей проверки…".into(), false);
+            }
+            92 => {
+                self.page = 1;
+                self.show_diagnostics = true;
+                self.show_window();
+                for slider in self.sliders {
+                    ShowWindow(slider, SW_HIDE);
+                }
+                ShowWindow(self.port_edit, SW_HIDE);
+                if !self.diagnosing
+                    && self.send(Action::Diagnose(self.settings.port, self.running[0]))
+                {
+                    self.diagnosing = true;
+                }
             }
             1 => {
                 if self.running.iter().any(|b| *b) {
@@ -406,7 +524,8 @@ impl App {
                 }
             }
             14 => {
-                if !self.checking && self.send(Action::Check) {
+                self.show_diagnostics = false;
+                if !self.checking && !self.alt_busy && self.send(Action::Check) {
                     self.checking = true;
                 }
             }
@@ -535,7 +654,11 @@ impl App {
             80 => {
                 self.settings.auto_update = !self.settings.auto_update;
                 self.save();
-                self.send(Action::AutoUpdates(self.settings.auto_update));
+                self.notify(
+                    "Настройка сохранена для следующего запуска. Ручная проверка доступна ниже."
+                        .into(),
+                    false,
+                );
             }
             81 => {
                 if !self.update_busy {
@@ -584,6 +707,21 @@ impl App {
             InvalidateRect(*button, null(), 0);
         }
     }
+    unsafe fn apply_profile(&mut self, profile: String) {
+        if self.busy[1] || self.alt_busy {
+            return;
+        }
+        let mut next = self.settings.clone();
+        next.strategy = profile;
+        if self.running[1] {
+            if self.send(Action::SwitchAlt(self.settings.clone(), next)) {
+                self.busy[1] = true;
+            }
+        } else {
+            self.settings = next;
+            self.save();
+        }
+    }
     unsafe fn refresh_animation(&mut self) {
         let mut allowed: i32 = 1;
         SystemParametersInfoW(
@@ -599,8 +737,20 @@ impl App {
             && !self.quitting;
         self.winter.running(on);
         if on && !self.animation_timer {
-            SetTimer(self.hwnd, 2, 33, None);
+            SetTimer(
+                self.hwnd,
+                2,
+                1000 / u32::from(self.settings.animation_fps.clamp(15, 60)),
+                None,
+            );
             self.animation_timer = true;
+        } else if on {
+            SetTimer(
+                self.hwnd,
+                2,
+                1000 / u32::from(self.settings.animation_fps.clamp(15, 60)),
+                None,
+            );
         } else if !on && self.animation_timer {
             KillTimer(self.hwnd, 2);
             self.animation_timer = false;
@@ -677,6 +827,68 @@ impl App {
     unsafe fn tray_menu(&mut self) {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, 70, wide("Открыть Relay").as_ptr());
+        for (id, label, active, busy) in [
+            (10, "Telegram", self.running[0], self.busy[0]),
+            (
+                11,
+                "Discord / YouTube",
+                self.running[1],
+                self.busy[1] || self.alt_busy,
+            ),
+            (50, "AI-маршрут", self.ai_running, self.ai_busy),
+        ] {
+            AppendMenuW(
+                menu,
+                MF_STRING
+                    | if active { MF_CHECKED } else { 0 }
+                    | if busy || !self.ready { MF_GRAYED } else { 0 },
+                id,
+                wide(label).as_ptr(),
+            );
+        }
+        let profiles = CreatePopupMenu();
+        for (i, profile) in self.strategies.iter().enumerate() {
+            AppendMenuW(
+                profiles,
+                MF_STRING
+                    | if *profile == self.settings.strategy {
+                        MF_CHECKED
+                    } else {
+                        0
+                    },
+                2000 + i,
+                wide(&relay::strategy_label(profile)).as_ptr(),
+            );
+        }
+        AppendMenuW(
+            menu,
+            MF_POPUP
+                | if self.alt_busy || self.busy[1] {
+                    MF_GRAYED
+                } else {
+                    0
+                },
+            profiles as usize,
+            wide("Профиль ALT").as_ptr(),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING
+                | if self.alt_busy || !self.admin {
+                    MF_GRAYED
+                } else {
+                    0
+                },
+            90,
+            wide("Подобрать ALT").as_ptr(),
+        );
+        AppendMenuW(menu, MF_STRING, 92, wide("Диагностика конфликтов").as_ptr());
+        AppendMenuW(
+            menu,
+            MF_STRING | if self.update_busy { MF_GRAYED } else { 0 },
+            81,
+            wide("Проверить обновления").as_ptr(),
+        );
         if self.update_ready.is_some() {
             AppendMenuW(menu, MF_STRING, 82, wide("Обновление готово…").as_ptr());
         }
@@ -704,9 +916,11 @@ impl App {
         let enabled = enabled
             && (!self.startup_busy || !matches!(id,1|10..=11|13|15..=16|20..=21|50|60..=61));
         let enabled = enabled && !self.install_pending;
+        let enabled =
+            enabled && !(self.alt_busy && matches!(id,1|10..=11|13|16|20..=21|60..=61|71|83|90));
         self.visible.insert(id);
         let hwnd = *self.buttons.entry(id).or_insert_with(|| {
-            CreateWindowExW(
+            let hwnd = CreateWindowExW(
                 0,
                 wide("BUTTON").as_ptr(),
                 null(),
@@ -719,7 +933,9 @@ impl App {
                 id as usize as HMENU,
                 GetModuleHandleW(null()),
                 null(),
-            )
+            );
+            round_control(hwnd, r.right - r.left, r.bottom - r.top);
+            hwnd
         });
         let mut old = RECT::default();
         GetWindowRect(hwnd, &mut old);
@@ -734,6 +950,7 @@ impl App {
             || old.bottom - old.top != r.bottom - r.top
         {
             MoveWindow(hwnd, r.left, r.top, r.right - r.left, r.bottom - r.top, 1);
+            round_control(hwnd, r.right - r.left, r.bottom - r.top);
         }
         let mut old_text = [0u16; 256];
         let n = GetWindowTextW(hwnd, old_text.as_mut_ptr(), 256);
@@ -748,8 +965,19 @@ impl App {
         }
     }
     unsafe fn draw(&mut self, dc: HDC, w: i32, h: i32) {
+        for slider in self.sliders {
+            if (IsWindowVisible(slider) != 0) != (self.page == 6) {
+                ShowWindow(slider, if self.page == 6 { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        if (IsWindowVisible(self.port_edit) != 0) != (self.page == 3) {
+            ShowWindow(
+                self.port_edit,
+                if self.page == 3 { SW_SHOW } else { SW_HIDE },
+            );
+        }
         self.visible.clear();
-        self.winter.draw(dc, w, h);
+        self.winter.draw(dc, w, h, self.settings.snow_count);
         fill(dc, rect(0, 0, 204, h), PANEL);
         fill(dc, rect(204, 0, 1, h), LINE);
         DrawIconEx(dc, 27, 32, self.icon, 32, 32, 0, null_mut(), DI_NORMAL);
@@ -769,6 +997,7 @@ impl App {
             "Настройки",
             "Нейросети",
             "Обновления",
+            "Оформление",
             "О приложении",
         ]
         .iter()
@@ -840,6 +1069,10 @@ impl App {
             5 => (
                 "Обновления",
                 "Новые релизы скачиваются автоматически из Absurd1k/relay.",
+            ),
+            6 => (
+                "Оформление",
+                "Настройте снег и плавность под свой компьютер.",
             ),
             _ => (
                 concat!("Relay / ", env!("CARGO_PKG_VERSION")),
@@ -1034,7 +1267,7 @@ impl App {
                     } else {
                         "Проверить сеть"
                     },
-                    !self.checking,
+                    !self.checking && !self.alt_busy,
                 );
                 text(
                     dc,
@@ -1064,52 +1297,109 @@ impl App {
                     },
                     !self.checking,
                 );
-                if self.checks.is_empty() {
-                    text(
-                        dc,
-                        "Здесь появятся результаты проверки.",
-                        rect(x, 192, width, 30),
-                        15,
-                        MUTED,
-                        DT_SINGLELINE,
-                    );
-                }
-                for (i, c) in self.checks.iter().enumerate() {
-                    let y = 186 + i as i32 * 94;
-                    box_round(dc, rect(x, y, width, 78), CARD, LINE, 12);
-                    text(
-                        dc,
-                        &format!("{}  {}", if c.ok { "●" } else { "○" }, c.name),
-                        rect(x + 20, y + 13, width - 160, 28),
-                        18,
-                        if c.ok { ACCENT } else { rgb(242, 159, 139) },
-                        DT_SINGLELINE,
-                    );
-                    text(
-                        dc,
-                        &format!("{} мс", c.ms),
-                        rect(x + width - 120, y + 15, 100, 24),
-                        13,
-                        MUTED,
-                        DT_RIGHT | DT_SINGLELINE,
-                    );
-                    text(
-                        dc,
-                        &c.detail,
-                        rect(x + 20, y + 46, width - 40, 23),
-                        12,
-                        MUTED,
-                        DT_SINGLELINE | DT_END_ELLIPSIS,
-                    );
-                }
-                text(
-                    dc,
-                    "Telegram Web проверяется напрямую, отдельно от MTProto. HTTPS-проверка не подтверждает видео и голос Discord — проверьте их в приложениях.",
-                    rect(x, 500, width, 85),
-                    14,
-                    MUTED,
-                    DT_WORDBREAK,
+                self.button(
+                    if self.alt_busy { 91 } else { 90 },
+                    rect(x + 224, 124, 185, 36),
+                    if self.alt_busy {
+                        "Отменить подбор"
+                    } else {
+                        "Подобрать ALT"
+                    },
+                    self.alt_busy || (self.admin && self.ready && !self.busy.iter().any(|b| *b)),
                 );
+                self.button(
+                    92,
+                    rect(x + 423, 124, 210, 36),
+                    if self.diagnosing {
+                        "Диагностика…"
+                    } else {
+                        "Диагностика конфликтов"
+                    },
+                    !self.diagnosing,
+                );
+                if self.show_diagnostics {
+                    if self.findings.is_empty() {
+                        text(
+                            dc,
+                            "Проверяем службы, адаптеры и порт…",
+                            rect(x, 185, width, 30),
+                            15,
+                            MUTED,
+                            DT_SINGLELINE,
+                        );
+                    }
+                    for (i, finding) in self.findings.iter().take(4).enumerate() {
+                        let y = 183 + i as i32 * 110;
+                        box_round(dc, rect(x, y, width, 96), CARD, LINE, 12);
+                        text(
+                            dc,
+                            &finding.title,
+                            rect(x + 18, y + 12, width - 36, 25),
+                            17,
+                            if finding.warning {
+                                rgb(239, 190, 113)
+                            } else {
+                                ACCENT
+                            },
+                            DT_SINGLELINE,
+                        );
+                        text(
+                            dc,
+                            &finding.detail,
+                            rect(x + 18, y + 43, width - 36, 46),
+                            13,
+                            MUTED,
+                            DT_WORDBREAK,
+                        );
+                    }
+                } else {
+                    if self.checks.is_empty() {
+                        text(
+                            dc,
+                            "Здесь появятся результаты проверки.",
+                            rect(x, 192, width, 30),
+                            15,
+                            MUTED,
+                            DT_SINGLELINE,
+                        );
+                    }
+                    for (i, c) in self.checks.iter().enumerate() {
+                        let y = 186 + i as i32 * 94;
+                        box_round(dc, rect(x, y, width, 78), CARD, LINE, 12);
+                        text(
+                            dc,
+                            &format!("{}  {}", if c.ok { "●" } else { "○" }, c.name),
+                            rect(x + 20, y + 13, width - 160, 28),
+                            18,
+                            if c.ok { ACCENT } else { rgb(242, 159, 139) },
+                            DT_SINGLELINE,
+                        );
+                        text(
+                            dc,
+                            &format!("{} мс", c.ms),
+                            rect(x + width - 120, y + 15, 100, 24),
+                            13,
+                            MUTED,
+                            DT_RIGHT | DT_SINGLELINE,
+                        );
+                        text(
+                            dc,
+                            &c.detail,
+                            rect(x + 20, y + 46, width - 40, 23),
+                            12,
+                            MUTED,
+                            DT_SINGLELINE | DT_END_ELLIPSIS,
+                        );
+                    }
+                    text(
+                        dc,
+                        "Telegram Web проверяется напрямую, отдельно от MTProto. HTTPS-проверка не подтверждает видео и голос Discord — проверьте их в приложениях.",
+                        rect(x, 500, width, 85),
+                        14,
+                        MUTED,
+                        DT_WORDBREAK,
+                    );
+                }
             }
             2 => {
                 self.button(30, rect(x, 124, 140, 36), "Копировать", true);
@@ -1173,7 +1463,7 @@ impl App {
                     DT_SINGLELINE,
                 );
                 box_round(dc, rect(x + 20, 321, 138, 38), rgb(12, 27, 27), LINE, 8);
-                MoveWindow(self.port_edit, x + 30, 330, 118, 21, 1);
+                place_control(self.hwnd, self.port_edit, rect(x + 30, 330, 118, 21));
                 if (IsWindowEnabled(self.port_edit) != 0) != idle {
                     EnableWindow(self.port_edit, if idle { 1 } else { 0 });
                 }
@@ -1389,7 +1679,7 @@ impl App {
                 );
                 text(
                     dc,
-                    "Проверка при запуске и каждые 30 минут. Скачивание идёт в фоне; перед установкой проверяются размер, Windows x64 и SHA-256 GitHub. Настройки сохраняются.",
+                    "Автоматическая проверка только при запуске. Скачивание идёт в фоне; перед установкой проверяются размер, Windows x64 и SHA-256 GitHub. Настройки сохраняются.",
                     rect(x + 20, 457, width - 40, 63),
                     14,
                     MUTED,
@@ -1399,6 +1689,75 @@ impl App {
                     dc,
                     "Для выпуска обновления: тег vX.Y.Z и файл Relay.exe в опубликованном релизе GitHub. Предварительные релизы тоже поддерживаются.",
                     rect(x, 560, width, 70),
+                    13,
+                    MUTED,
+                    DT_WORDBREAK,
+                );
+            }
+            6 => {
+                box_round(dc, rect(x, 124, width, 350), CARD, LINE, 14);
+                text(
+                    dc,
+                    &format!("Плотность снега · {}", self.settings.snow_count),
+                    rect(x + 24, 149, width - 48, 30),
+                    19,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                text(
+                    dc,
+                    "Нет снега",
+                    rect(x + 24, 226, width - 48, 24),
+                    12,
+                    MUTED,
+                    DT_SINGLELINE,
+                );
+                text(
+                    dc,
+                    "Больше снега",
+                    rect(x + 24, 226, width - 48, 24),
+                    12,
+                    MUTED,
+                    DT_SINGLELINE | DT_RIGHT,
+                );
+                text(
+                    dc,
+                    &format!("Плавность · {} кадров/с", self.settings.animation_fps),
+                    rect(x + 24, 285, width - 48, 30),
+                    19,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                text(
+                    dc,
+                    "Экономнее",
+                    rect(x + 24, 362, width - 48, 24),
+                    12,
+                    MUTED,
+                    DT_SINGLELINE,
+                );
+                text(
+                    dc,
+                    "Плавнее",
+                    rect(x + 24, 362, width - 48, 24),
+                    12,
+                    MUTED,
+                    DT_SINGLELINE | DT_RIGHT,
+                );
+                place_control(
+                    self.hwnd,
+                    self.sliders[0],
+                    rect(x + 24, 190, width - 48, 32),
+                );
+                place_control(
+                    self.hwnd,
+                    self.sliders[1],
+                    rect(x + 24, 326, width - 48, 32),
+                );
+                text(
+                    dc,
+                    "Настройки сохраняются автоматически. При скрытии окна и потере фокуса анимация останавливается. Размер буфера отрисовки не зависит от плотности снега или FPS; высокая плавность увеличивает нагрузку на процессор.",
+                    rect(x + 24, 401, width - 48, 63),
                     13,
                     MUTED,
                     DT_WORDBREAK,
@@ -1478,6 +1837,28 @@ unsafe fn fill(dc: HDC, r: RECT, c: u32) {
     let b = CreateSolidBrush(c);
     FillRect(dc, &r, b);
     DeleteObject(b);
+}
+unsafe fn round_control(hwnd: HWND, width: i32, height: i32) {
+    let region = CreateRoundRectRgn(0, 0, width + 1, height + 1, 16, 16);
+    if !region.is_null() && SetWindowRgn(hwnd, region, 1) == 0 {
+        DeleteObject(region);
+    }
+}
+unsafe fn place_control(parent: HWND, hwnd: HWND, r: RECT) {
+    let mut old = RECT::default();
+    GetWindowRect(hwnd, &mut old);
+    let mut point = POINT {
+        x: old.left,
+        y: old.top,
+    };
+    ScreenToClient(parent, &mut point);
+    if point.x != r.left
+        || point.y != r.top
+        || old.right - old.left != r.right - r.left
+        || old.bottom - old.top != r.bottom - r.top
+    {
+        MoveWindow(hwnd, r.left, r.top, r.right - r.left, r.bottom - r.top, 1);
+    }
 }
 unsafe fn box_round(dc: HDC, r: RECT, c: u32, border: u32, radius: i32) {
     let b = CreateSolidBrush(c);
@@ -1623,6 +2004,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 wide("Segoe UI").as_ptr(),
             );
             SendMessageW(app.port_edit, WM_SETFONT, app.port_font as usize, 1);
+            InitCommonControlsEx(&INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_BAR_CLASSES,
+            });
+            for (i, (min, max, value)) in [
+                (0, 240, app.settings.snow_count),
+                (15, 60, app.settings.animation_fps),
+            ]
+            .iter()
+            .enumerate()
+            {
+                let slider = CreateWindowExW(
+                    0,
+                    wide("msctls_trackbar32").as_ptr(),
+                    null(),
+                    WS_CHILD | WS_TABSTOP | TBS_NOTICKS,
+                    0,
+                    0,
+                    500,
+                    32,
+                    hwnd,
+                    (1100 + i) as HMENU,
+                    GetModuleHandleW(null()),
+                    null(),
+                );
+                SendMessageW(slider, TBM_SETRANGEMIN, 0, *min as isize);
+                SetWindowTheme(slider, wide("").as_ptr(), wide("").as_ptr());
+                SendMessageW(slider, TBM_SETRANGEMAX, 0, *max as isize);
+                SendMessageW(slider, TBM_SETPOS, 1, *value as isize);
+                SendMessageW(slider, TBM_SETPAGESIZE, 0, if i == 0 { 20 } else { 5 });
+                app.sliders[i] = slider;
+            }
             SetTimer(hwnd, 1, 500, None);
             0
         }
@@ -1686,7 +2099,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DRAWITEM => {
             let item = &*(lp as *const DRAWITEMSTRUCT);
             let id = item.CtlID;
-            let selected = (100..=106).contains(&id) && id - 100 == app.page as u32;
+            let selected = (100..=107).contains(&id) && id - 100 == app.page as u32;
             let primary = id == 1 || id == 21;
             let disabled = item.itemState & ODS_DISABLED != 0;
             let color = if primary {
@@ -1700,7 +2113,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Owner-drawn buttons still receive an erased rectangular surface.
             // Paint the parent colour before drawing the rounded silhouette.
             let background = match id {
-                100..=106 => PANEL,
+                100..=107 => PANEL,
                 1 | 10..=12 | 15..=16 | 20..=22 | 40..=41 | 50 | 60..=61 | 80..=81 | 83 => CARD,
                 13 => {
                     if app.page == 0 {
@@ -1754,6 +2167,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             1
         }
+        WM_HSCROLL if app.sliders.contains(&(lp as HWND)) => {
+            let slider = lp as HWND;
+            let value = SendMessageW(slider, TBM_GETPOS, 0, 0) as u16;
+            if slider == app.sliders[0] {
+                app.settings.snow_count = value.min(240);
+            } else {
+                app.settings.animation_fps = value.clamp(15, 60);
+                app.refresh_animation();
+            }
+            // Save at release/end or after keyboard changes, never for every drag sample.
+            if (wp & 0xffff) as u32 != TB_THUMBTRACK {
+                app.save();
+            }
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_NOTIFY if app.sliders.contains(&(*(lp as *const NMHDR)).hwndFrom) => {
+            let header = &*(lp as *const NMHDR);
+            if header.code == NM_CUSTOMDRAW {
+                let item = &*(lp as *const NMCUSTOMDRAW);
+                if item.dwDrawStage == CDDS_PREPAINT {
+                    fill(item.hdc, item.rc, CARD);
+                    return CDRF_NOTIFYITEMDRAW as isize;
+                }
+                if item.dwDrawStage == CDDS_ITEMPREPAINT {
+                    match item.dwItemSpec as u32 {
+                        TBCD_CHANNEL => {
+                            let mut r = item.rc;
+                            let center = (r.top + r.bottom) / 2;
+                            r.top = center - 3;
+                            r.bottom = center + 3;
+                            box_round(item.hdc, r, LINE, LINE, 3);
+                        }
+                        TBCD_THUMB => box_round(item.hdc, item.rc, ACCENT, ACCENT, 7),
+                        _ => {}
+                    }
+                    return CDRF_SKIPDEFAULT as isize;
+                }
+            }
+            0
+        }
         WM_COMMAND => {
             if (wp & 0xffff) == 999 && (wp >> 16) == EN_CHANGE as usize {
                 let mut buf = [0u16; 16];
@@ -1804,6 +2258,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_CTLCOLORSTATIC if app.sliders.contains(&(lp as HWND)) => {
+            let dc = wp as HDC;
+            SetBkColor(dc, CARD);
+            SetDCBrushColor(dc, CARD);
+            GetStockObject(DC_BRUSH) as isize
+        }
         WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC if lp as HWND == app.port_edit => {
             let dc = wp as HDC;
             SetTextColor(
@@ -1819,6 +2279,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             GetStockObject(DC_BRUSH) as isize
         }
         WM_CLOSE => {
+            if app.quitting && app.alt_busy {
+                if let Some(backend) = &app.backend {
+                    backend
+                        .cancel_alt
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                app.quitting = false;
+                app.show_window();
+                app.notify(
+                    "Подбор отменяется. Дождитесь восстановления профиля перед выходом.".into(),
+                    true,
+                );
+                return 0;
+            }
             if !app.quitting && app.tray_added {
                 ShowWindow(hwnd, SW_HIDE);
                 return 0;
