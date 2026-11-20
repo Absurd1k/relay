@@ -2,7 +2,10 @@ pub mod ai;
 pub mod bundle;
 pub mod engine;
 pub mod platform;
+#[cfg(windows)]
+pub mod service;
 pub mod startup;
+pub mod updates;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -20,6 +23,8 @@ pub struct Settings {
     pub resume_telegram: bool,
     pub resume_zapret: bool,
     pub resume_ai: bool,
+    pub auto_update: bool,
+    pub winter_animation: bool,
 }
 
 impl Default for Settings {
@@ -29,7 +34,7 @@ impl Default for Settings {
         Self {
             telegram: true,
             zapret: true,
-            strategy: "general.bat".into(),
+            strategy: "general (ALT).bat".into(),
             port: 1443,
             secret: bytes.iter().map(|b| format!("{b:02x}")).collect(),
             auto_start: false,
@@ -37,6 +42,8 @@ impl Default for Settings {
             resume_telegram: false,
             resume_zapret: false,
             resume_ai: false,
+            auto_update: true,
+            winter_animation: true,
         }
     }
 }
@@ -59,8 +66,19 @@ impl Settings {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let value: Self = serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
-            .map_err(|e| format!("Не удалось прочитать настройки: {e}"))?;
+        let mut value: Self =
+            serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+                .map_err(|e| format!("Не удалось прочитать настройки: {e}"))?;
+        if !safe_strategy(&value.strategy)
+            && value.strategy.starts_with("general")
+            && value.strategy.ends_with(".bat")
+            && value
+                .strategy
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " ()_- .".contains(c))
+        {
+            value.strategy = "general (ALT).bat".into();
+        }
         value.validate()?;
         Ok(value)
     }
@@ -102,12 +120,23 @@ impl Settings {
 }
 
 pub fn safe_strategy(name: &str) -> bool {
-    name.starts_with("general")
-        && name.ends_with(".bat")
-        && !name.contains(['/', '\\', ':'])
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || " ()_- .".contains(c))
+    strategy_number(name).is_some()
+}
+
+pub fn strategy_number(name: &str) -> Option<u32> {
+    let n = name.strip_prefix("general (ALT")?.strip_suffix(").bat")?;
+    if n.is_empty() {
+        Some(1)
+    } else if n.bytes().all(|c| c.is_ascii_digit()) && !n.starts_with('0') {
+        n.parse::<u32>().ok().filter(|n| *n >= 2 && *n <= 999)
+    } else {
+        None
+    }
+}
+pub fn strategy_label(name: &str) -> String {
+    strategy_number(name)
+        .map(|n| format!("ALT {n}"))
+        .unwrap_or_else(|| "ALT 1".into())
 }
 
 pub fn data_dir() -> PathBuf {
@@ -157,6 +186,21 @@ mod tests {
         assert!(!s.auto_start);
         assert!(!s.auto_connect);
         assert!(s.restore_plan().is_empty());
+    }
+    #[test]
+    fn only_numbered_alt_profiles_are_selectable() {
+        for name in [
+            "service.bat",
+            "general.bat",
+            "general (FAKE TLS AUTO).bat",
+            "general (ALT01).bat",
+            "general (ALT1).bat",
+        ] {
+            assert!(!safe_strategy(name), "{name}");
+        }
+        assert_eq!(strategy_number("general (ALT).bat"), Some(1));
+        assert_eq!(strategy_number("general (ALT13).bat"), Some(13));
+        assert_eq!(strategy_label("general (ALT11).bat"), "ALT 11");
     }
     #[test]
     fn restore_plan_preserves_only_explicit_service_states() {

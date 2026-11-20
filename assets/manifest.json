@@ -1,5 +1,5 @@
 {
-  "bundle_sha256": "5cea5a5abfca16269159680138477b9150ebec5f270e249c1b5fe7877f7037a2",
+  "bundle_sha256": "79304516f025f65b873c54ed7772b826538fdeb4a8883e229d518f859d1b9a9d",
   "telegram_rust_commit": "53f392280a370199ffe5c6ef0ac88808ed17c575",
   "zapret_version": "1.10.3",
   "files": {
@@ -60,6 +60,6 @@
     "licenses/tg-ws-proxy-rs-MIT.txt": "b407810116eab6dd51e0fb367e5d12fac54adedb43450b0eb7a44f7b99bd878b",
     "licenses/tg-ws-proxy-Flowseal-MIT.txt": "2a98256df06052c3b132cf522e356da90ade2f749b6f7435f7cdafd1d9123fa2",
     "licenses/dns.malw.link-MIT.txt": "7365d821e9d1fe0d2b618bc757af38726c75d79dd8ec2231c74f3532882ee33a",
-    "licenses/RUST_LICENSES.txt": "f3f15d19339a5e5cc40ad6518a663b163b82eb6e8a5e80210d383b61ec609c13"
+    "licenses/RUST_LICENSES.txt": "5240fa9f35cb1a4e79aab34dbc8b8225ed3f24c7f983720e294bd53b5c75336b"
   }
 }

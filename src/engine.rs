@@ -6,6 +6,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, SyncSender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -32,6 +36,8 @@ pub enum Action {
     Check,
     Shutdown,
     Startup(Settings),
+    AutoUpdates(bool),
+    CheckUpdate,
 }
 pub enum Event {
     Ready(Result<(PathBuf, Vec<String>), String>),
@@ -40,6 +46,7 @@ pub enum Event {
     Checks(Vec<Check>),
     Memory(f64),
     Startup(Result<Settings, String>),
+    Update(crate::updates::Status),
 }
 #[derive(Clone)]
 pub struct Check {
@@ -65,6 +72,9 @@ impl Backend {
             let _ = events.send(Event::Ready(ready));
             repaint();
             let mut last_memory = Instant::now();
+            let update_busy = Arc::new(AtomicBool::new(false));
+            let mut auto_updates = false;
+            let mut next_update = Instant::now();
             loop {
                 match commands.recv_timeout(Duration::from_millis(500)) {
                     Ok(Action::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -84,6 +94,19 @@ impl Backend {
                         let _ = events.send(Event::Startup(result));
                         repaint();
                     }
+                    Ok(Action::AutoUpdates(enabled)) => {
+                        auto_updates = enabled;
+                        next_update = Instant::now();
+                    }
+                    Ok(Action::CheckUpdate) => {
+                        spawn_update(
+                            manager.data.clone(),
+                            true,
+                            events.clone(),
+                            repaint.clone(),
+                            update_busy.clone(),
+                        );
+                    }
                     Ok(Action::Check) => {
                         let sender = events.clone();
                         let wake = repaint.clone();
@@ -98,6 +121,16 @@ impl Backend {
                 if manager.poll() {
                     repaint();
                 }
+                if auto_updates && Instant::now() >= next_update {
+                    next_update = Instant::now() + crate::updates::INTERVAL;
+                    spawn_update(
+                        manager.data.clone(),
+                        false,
+                        events.clone(),
+                        repaint.clone(),
+                        update_busy.clone(),
+                    );
+                }
                 if last_memory.elapsed() >= Duration::from_secs(5) {
                     let total = platform::memory_mb(std::process::id()).unwrap_or(0.0)
                         + manager
@@ -105,6 +138,14 @@ impl Backend {
                             .iter()
                             .filter_map(|(_, c)| platform::memory_mb(c.id()))
                             .sum::<f64>();
+                    #[cfg(windows)]
+                    let total = total
+                        + manager
+                            .service
+                            .as_ref()
+                            .and_then(|s| s.pid())
+                            .and_then(platform::memory_mb)
+                            .unwrap_or(0.0);
                     let _ = events.try_send(Event::Memory(total));
                     last_memory = Instant::now();
                     repaint();
@@ -142,6 +183,8 @@ struct Manager {
     children: Vec<(Kind, Child)>,
     events: SyncSender<Event>,
     ai: Option<crate::ai::Guard>,
+    #[cfg(windows)]
+    service: Option<crate::service::Service>,
 }
 impl Manager {
     fn new(data: PathBuf, events: SyncSender<Event>) -> Self {
@@ -152,6 +195,8 @@ impl Manager {
             children: vec![],
             events,
             ai: None,
+            #[cfg(windows)]
+            service: None,
         }
     }
     fn prepare(&mut self) -> Result<(PathBuf, Vec<String>), String> {
@@ -163,7 +208,7 @@ impl Manager {
             .filter_map(|e| e.file_name().into_string().ok())
             .filter(|name| safe_strategy(name))
             .collect();
-        strategies.sort_by_key(|n| (n != "general.bat", n.clone()));
+        strategies.sort_by_key(|n| crate::strategy_number(n).unwrap_or(u32::MAX));
         for name in [
             "list-general-user.txt",
             "list-exclude-user.txt",
@@ -175,6 +220,24 @@ impl Manager {
             }
         }
         self.root = Some(root.clone());
+        #[cfg(windows)]
+        if platform::is_admin() {
+            match crate::service::Service::attach() {
+                Ok(service) => {
+                    self.service = service;
+                    if self.service.is_some() {
+                        let _ = self.events.send(Event::State(
+                            Kind::Zapret,
+                            true,
+                            "Подключена работающая служба RelayZapret".into(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let _ = self.events.try_send(Event::Log(e));
+                }
+            }
+        }
         Ok((root, strategies))
     }
     fn start(&mut self, kind: Kind, settings: Settings) -> Result<(), String> {
@@ -187,6 +250,40 @@ impl Manager {
             }
             let _ = self.events.send(Event::State(Kind::Ai, true, "AI-маршрут настроен через dns.malw.link. Перезапустите браузер и проверьте нужный сервис.".into()));
             return Ok(());
+        }
+        if kind == Kind::Zapret {
+            if !platform::is_admin() {
+                return Err("Для службы zapret нужны права администратора.".into());
+            }
+            settings.validate()?;
+            #[cfg(windows)]
+            {
+                if self.service.as_ref().is_some_and(|s| s.running()) {
+                    let _ = self.events.send(Event::State(
+                        kind,
+                        true,
+                        "Служба RelayZapret уже работает".into(),
+                    ));
+                    return Ok(());
+                }
+                let root = self.root.as_ref().ok_or("Компоненты ещё не готовы")?;
+                let dir = crate::service::prepare_files(root)?;
+                let script = std::fs::read_to_string(root.join("zapret").join(&settings.strategy))
+                    .map_err(|e| e.to_string())?;
+                let args = parse_strategy(&script, &dir)?;
+                self.service = Some(crate::service::Service::start(&dir, &args)?);
+                let _ = self.events.send(Event::State(
+                    kind,
+                    true,
+                    format!(
+                        "Служба RelayZapret запущена · {}",
+                        crate::strategy_label(&settings.strategy)
+                    ),
+                ));
+                return Ok(());
+            }
+            #[cfg(not(windows))]
+            return Err("Служба доступна только в Windows".into());
         }
         if self.children.iter().any(|(k, _)| *k == kind) {
             return Ok(());
@@ -233,19 +330,7 @@ impl Manager {
                 cmd.current_dir(&self.data);
                 cmd
             }
-            Kind::Zapret => {
-                if !platform::is_admin() {
-                    return Err("Для zapret нужны права администратора. Нажмите «Запустить с правами администратора».".into());
-                }
-                let dir = root.join("zapret");
-                let script = std::fs::read_to_string(dir.join(&settings.strategy))
-                    .map_err(|e| e.to_string())?;
-                let args = parse_strategy(&script, &dir)?;
-                let mut cmd = Command::new(dir.join("bin/winws.exe"));
-                cmd.args(args).current_dir(dir.join("bin"));
-                cmd
-            }
-            Kind::Ai => unreachable!(),
+            Kind::Zapret | Kind::Ai => unreachable!(),
         };
         command
             .stdout(Stdio::piped())
@@ -335,6 +420,20 @@ impl Manager {
         Ok(())
     }
     fn stop(&mut self, kind: Kind) {
+        #[cfg(windows)]
+        if kind == Kind::Zapret {
+            if let Some(service) = &mut self.service
+                && let Err(e) = service.stop()
+            {
+                let _ = self.events.try_send(Event::State(kind, true, e));
+                return;
+            }
+            self.service = None;
+            let _ = self
+                .events
+                .try_send(Event::State(kind, false, "Остановлен".into()));
+            return;
+        }
         if kind == Kind::Ai {
             if let Some(guard) = &mut self.ai
                 && let Err(e) = guard.disable()
@@ -363,6 +462,16 @@ impl Manager {
     }
     fn poll(&mut self) -> bool {
         let mut changed = false;
+        #[cfg(windows)]
+        if self.service.as_ref().is_some_and(|s| !s.running()) {
+            self.service = None;
+            let _ = self.events.try_send(Event::State(
+                Kind::Zapret,
+                false,
+                "Служба RelayZapret остановилась".into(),
+            ));
+            changed = true;
+        }
         let mut i = 0;
         while i < self.children.len() {
             match self.children[i].1.try_wait() {
@@ -380,6 +489,28 @@ impl Manager {
         }
         changed
     }
+}
+fn spawn_update(
+    data: PathBuf,
+    force: bool,
+    events: SyncSender<Event>,
+    repaint: Arc<impl Fn() + Send + Sync + 'static>,
+    busy: Arc<AtomicBool>,
+) {
+    if busy.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    thread::spawn(move || {
+        let result = crate::updates::check(&data, force, |status| {
+            let _ = events.try_send(Event::Update(status));
+            repaint();
+        });
+        if let Err(e) = result {
+            let _ = events.try_send(Event::Update(crate::updates::Status::Error(e)));
+            repaint();
+        }
+        busy.store(false, Ordering::Release);
+    });
 }
 impl Drop for Manager {
     fn drop(&mut self) {

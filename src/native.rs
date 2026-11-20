@@ -9,7 +9,7 @@ use std::{
     path::PathBuf,
     ptr::{null, null_mut},
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, IsWindowEnabled};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION, NIN_SELECT,
     NOTIFYICON_VERSION_4, NOTIFYICONDATAW, Shell_NotifyIconW,
@@ -27,10 +27,10 @@ const SHOW_MESSAGE: u32 = WM_APP + 3;
 const fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | (g << 8) | (b << 16)
 }
-const BG: u32 = rgb(13, 17, 23);
-const PANEL: u32 = rgb(20, 26, 34);
-const CARD: u32 = rgb(25, 32, 42);
-const LINE: u32 = rgb(40, 50, 63);
+const BG: u32 = rgb(8, 19, 22);
+const PANEL: u32 = rgb(10, 25, 24);
+const CARD: u32 = rgb(17, 37, 32);
+const LINE: u32 = rgb(40, 71, 62);
 const TEXT: u32 = rgb(231, 237, 244);
 const MUTED: u32 = rgb(153, 167, 185);
 const ACCENT: u32 = rgb(111, 232, 193);
@@ -68,6 +68,7 @@ struct App {
     buttons: BTreeMap<u32, HWND>,
     visible: BTreeSet<u32>,
     port_edit: HWND,
+    port_font: HFONT,
     log_offset: usize,
     ai_running: bool,
     ai_busy: bool,
@@ -77,6 +78,14 @@ struct App {
     tray_added: bool,
     taskbar_created: u32,
     quitting: bool,
+    winter: crate::winter::Winter,
+    surface: Option<crate::winter::Surface>,
+    animation_timer: bool,
+    update_status: String,
+    update_ready: Option<relay::updates::Download>,
+    update_busy: bool,
+    install_pending: bool,
+    close_after_service: bool,
 }
 impl App {
     fn new(icon: HICON, hero_icon: HICON, tray_icon: HICON) -> Self {
@@ -107,6 +116,7 @@ impl App {
             buttons: BTreeMap::new(),
             visible: BTreeSet::new(),
             port_edit: null_mut(),
+            port_font: null_mut(),
             log_offset: 0,
             ai_running: false,
             ai_busy: false,
@@ -116,6 +126,14 @@ impl App {
             tray_added: false,
             taskbar_created: 0,
             quitting: false,
+            winter: crate::winter::Winter::new(),
+            surface: None,
+            animation_timer: false,
+            update_status: "Проверка GitHub каждые 30 минут".into(),
+            update_ready: None,
+            update_busy: false,
+            install_pending: false,
+            close_after_service: false,
         }
     }
     fn notify(&mut self, s: String, error: bool) {
@@ -171,7 +189,11 @@ impl App {
         }
     }
     fn restore_saved(&mut self) {
-        let plan = self.settings.restore_plan();
+        let mut settings = self.settings.clone();
+        if std::env::args().any(|a| a == "--resume-after-update") {
+            settings.auto_connect = true;
+        }
+        let plan = settings.restore_plan();
         if plan.is_empty() {
             return;
         }
@@ -207,10 +229,11 @@ impl App {
                         self.strategies = s;
                         self.ready = true;
                         if !self.strategies.contains(&self.settings.strategy) {
-                            self.settings.strategy = "general.bat".into();
+                            self.settings.strategy = "general (ALT).bat".into();
                         }
                         self.notify("Компоненты готовы. Можно подключаться.".into(), false);
                         self.restore_saved();
+                        self.send(Action::AutoUpdates(self.settings.auto_update));
                     }
                     Err(e) => self.notify(e, true),
                 },
@@ -226,6 +249,7 @@ impl App {
                                 }
                             } else {
                                 self.quitting = false;
+                                self.install_pending = false;
                                 unsafe {
                                     self.show_window();
                                 }
@@ -235,6 +259,20 @@ impl App {
                         let i = if k == Kind::Telegram { 0 } else { 1 };
                         self.running[i] = r;
                         self.busy[i] = false;
+                        if k == Kind::Zapret && self.close_after_service {
+                            self.close_after_service = false;
+                            if !r {
+                                unsafe {
+                                    PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
+                                }
+                            } else {
+                                self.quitting = false;
+                                self.install_pending = false;
+                                unsafe {
+                                    self.show_window();
+                                }
+                            }
+                        }
                     }
                     let error = (!r && m != "Остановлен") || m.starts_with("Не удалось");
                     self.notify(format!("{}: {m}", k.name()), error);
@@ -260,13 +298,61 @@ impl App {
                         Err(e) => self.notify(e, true),
                     }
                 }
+                Event::Update(status) => {
+                    use relay::updates::Status;
+                    match status {
+                        Status::Checking => {
+                            self.update_busy = true;
+                            self.update_status = "Проверка новых релизов GitHub…".into();
+                        }
+                        Status::Downloading {
+                            version,
+                            bytes,
+                            total,
+                        } => {
+                            self.update_busy = true;
+                            self.update_status =
+                                format!("Скачивается v{version} · {}%", bytes * 100 / total.max(1));
+                        }
+                        Status::Ready(download) => {
+                            self.update_busy = false;
+                            self.update_status =
+                                format!("Версия {} скачана и проверена", download.version);
+                            let announce = self
+                                .update_ready
+                                .as_ref()
+                                .is_none_or(|d| d.version != download.version);
+                            self.update_ready = Some(download);
+                            if announce {
+                                unsafe {
+                                    self.update_balloon();
+                                }
+                            }
+                        }
+                        Status::Current => {
+                            self.update_busy = false;
+                            self.update_status = format!(
+                                "Установлена актуальная версия {}",
+                                env!("CARGO_PKG_VERSION")
+                            );
+                        }
+                        Status::Skipped => {
+                            self.update_busy = false;
+                        }
+                        Status::Error(e) => {
+                            self.update_busy = false;
+                            self.update_status = format!("Не удалось проверить обновление: {e}");
+                            engine::push_log(&mut self.logs, self.update_status.clone());
+                        }
+                    }
+                }
             }
         }
         changed
     }
     unsafe fn action(&mut self, id: u32) {
         match id {
-            100..=105 => {
+            100..=106 => {
                 self.page = (id - 100) as usize;
                 ShowWindow(
                     self.port_edit,
@@ -341,7 +427,12 @@ impl App {
             20 => {
                 let menu = CreatePopupMenu();
                 for (i, n) in self.strategies.iter().enumerate() {
-                    AppendMenuW(menu, MF_STRING, 1000 + i, wide(n).as_ptr());
+                    AppendMenuW(
+                        menu,
+                        MF_STRING,
+                        1000 + i,
+                        wide(&relay::strategy_label(n)).as_ptr(),
+                    );
                 }
                 let mut p = POINT::default();
                 GetCursorPos(&mut p);
@@ -436,6 +527,43 @@ impl App {
                     self.settings = old;
                 }
             }
+            62 => {
+                self.settings.winter_animation = !self.settings.winter_animation;
+                self.save();
+                self.refresh_animation();
+            }
+            80 => {
+                self.settings.auto_update = !self.settings.auto_update;
+                self.save();
+                self.send(Action::AutoUpdates(self.settings.auto_update));
+            }
+            81 => {
+                if !self.update_busy {
+                    self.update_busy = true;
+                    self.send(Action::CheckUpdate);
+                }
+            }
+            82 => {
+                self.page = 5;
+                self.show_window();
+            }
+            83 => {
+                if let Some(download) = &self.update_ready {
+                    if let Err(e) = relay::updates::verify_download(download) {
+                        self.notify(e, true);
+                        return;
+                    }
+                    self.settings.resume_telegram = self.running[0];
+                    self.settings.resume_zapret = self.running[1];
+                    self.settings.resume_ai = self.ai_running;
+                    if !self.save() {
+                        return;
+                    }
+                    self.install_pending = true;
+                    self.quitting = true;
+                    PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
+                }
+            }
             44 => self.page = 4,
             40 => open_url("https://github.com/valnesfjord/tg-ws-proxy-rs"),
             41 => open_url("https://github.com/Flowseal/zapret-discord-youtube"),
@@ -452,6 +580,55 @@ impl App {
             _ => {}
         }
         InvalidateRect(self.hwnd, null(), 0);
+        for button in self.buttons.values() {
+            InvalidateRect(*button, null(), 0);
+        }
+    }
+    unsafe fn refresh_animation(&mut self) {
+        let mut allowed: i32 = 1;
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            &mut allowed as *mut _ as _,
+            0,
+        );
+        let on = self.settings.winter_animation
+            && allowed != 0
+            && IsWindowVisible(self.hwnd) != 0
+            && GetForegroundWindow() == self.hwnd
+            && !self.quitting;
+        self.winter.running(on);
+        if on && !self.animation_timer {
+            SetTimer(self.hwnd, 2, 80, None);
+            self.animation_timer = true;
+        } else if !on && self.animation_timer {
+            KillTimer(self.hwnd, 2);
+            self.animation_timer = false;
+        }
+        if IsWindowVisible(self.hwnd) == 0 {
+            self.surface = None;
+        }
+    }
+    unsafe fn update_balloon(&self) {
+        if !self.tray_added {
+            return;
+        }
+        use windows_sys::Win32::UI::Shell::{NIF_INFO, NIIF_INFO, NIM_MODIFY};
+        let mut data: NOTIFYICONDATAW = std::mem::zeroed();
+        data.cbSize = std::mem::size_of_val(&data) as u32;
+        data.hWnd = self.hwnd;
+        data.uID = 1;
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_INFO;
+        for (dst, c) in data
+            .szInfoTitle
+            .iter_mut()
+            .zip("Relay — обновление скачано".encode_utf16())
+        {
+            *dst = c;
+        }
+        for(dst,c)in data.szInfo.iter_mut().zip("Откройте раздел «Обновления», чтобы перезапустить приложение и установить новую версию.".encode_utf16()){*dst=c;}
+        Shell_NotifyIconW(NIM_MODIFY, &data);
     }
     unsafe fn show_window(&self) {
         ShowWindow(
@@ -500,6 +677,9 @@ impl App {
     unsafe fn tray_menu(&mut self) {
         let menu = CreatePopupMenu();
         AppendMenuW(menu, MF_STRING, 70, wide("Открыть Relay").as_ptr());
+        if self.update_ready.is_some() {
+            AppendMenuW(menu, MF_STRING, 82, wide("Обновление готово…").as_ptr());
+        }
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
         AppendMenuW(menu, MF_STRING, 71, wide("Выход").as_ptr());
         let mut point = POINT::default();
@@ -523,6 +703,7 @@ impl App {
     unsafe fn button(&mut self, id: u32, r: RECT, label: &str, enabled: bool) {
         let enabled = enabled
             && (!self.startup_busy || !matches!(id,1|10..=11|13|15..=16|20..=21|50|60..=61));
+        let enabled = enabled && !self.install_pending;
         self.visible.insert(id);
         let hwnd = *self.buttons.entry(id).or_insert_with(|| {
             CreateWindowExW(
@@ -559,22 +740,23 @@ impl App {
         if String::from_utf16_lossy(&old_text[..n as usize]) != label {
             SetWindowTextW(hwnd, wide(label).as_ptr());
         }
-        EnableWindow(hwnd, if enabled { 1 } else { 0 });
+        if (IsWindowEnabled(hwnd) != 0) != enabled {
+            EnableWindow(hwnd, if enabled { 1 } else { 0 });
+        }
         if IsWindowVisible(hwnd) == 0 {
             ShowWindow(hwnd, SW_SHOW);
         }
-        InvalidateRect(hwnd, null(), 0);
     }
     unsafe fn draw(&mut self, dc: HDC, w: i32, h: i32) {
         self.visible.clear();
-        fill(dc, rect(0, 0, w, h), BG);
+        self.winter.draw(dc, w, h);
         fill(dc, rect(0, 0, 204, h), PANEL);
         fill(dc, rect(204, 0, 1, h), LINE);
         DrawIconEx(dc, 27, 32, self.icon, 32, 32, 0, null_mut(), DI_NORMAL);
         text(dc, "relay", rect(73, 24, 120, 46), 32, TEXT, DT_SINGLELINE);
         text(
             dc,
-            "СВОБОДА ПОДКЛЮЧЕНИЯ",
+            "WINTER EDITION / 2027",
             rect(24, 85, 172, 20),
             10,
             MUTED,
@@ -586,6 +768,7 @@ impl App {
             "Журнал",
             "Настройки",
             "Нейросети",
+            "Обновления",
             "О приложении",
         ]
         .iter()
@@ -596,6 +779,17 @@ impl App {
                 rect(20, 145 + i as i32 * 49, 164, 40),
                 label,
                 true,
+            );
+        }
+        if h >= 760 {
+            crate::winter::Winter::tree(dc, 102, 540);
+            text(
+                dc,
+                "Тёплых праздников",
+                rect(20, 620, 164, 24),
+                13,
+                rgb(217, 180, 102),
+                DT_CENTER | DT_SINGLELINE,
             );
         }
         text(
@@ -620,7 +814,7 @@ impl App {
         );
         text(
             dc,
-            "v0.1.0 · Windows x64",
+            concat!("v", env!("CARGO_PKG_VERSION"), " · Windows x64"),
             rect(24, h - 50, 170, 22),
             11,
             MUTED,
@@ -630,8 +824,8 @@ impl App {
         let width = w - x - 28;
         let (title, sub) = match self.page {
             0 => (
-                "Ваш интернет. Без лишнего.",
-                "Telegram, Discord и YouTube — в одном приложении.",
+                "Всё на связи. Даже в метель.",
+                "Зимний Relay · Telegram, Discord, YouTube и AI",
             ),
             1 => (
                 "Проверка сети",
@@ -643,13 +837,35 @@ impl App {
                 "Доступ к нейросетям",
                 "Внешний адрес, который видит сервис.",
             ),
+            5 => (
+                "Обновления",
+                "Новые релизы скачиваются автоматически из Absurd1k/relay.",
+            ),
             _ => (
-                "Relay / 0.1",
+                concat!("Relay / ", env!("CARGO_PKG_VERSION")),
                 "Нативная утилита, собранная с уважением к ресурсам ПК.",
             ),
         };
         text(dc, title, rect(x, 28, width, 42), 28, TEXT, DT_SINGLELINE);
-        text(dc, sub, rect(x, 77, width, 26), 14, MUTED, DT_SINGLELINE);
+        text(
+            dc,
+            sub,
+            rect(x, 77, width - 230, 26),
+            14,
+            MUTED,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        self.button(
+            62,
+            rect(w - 238, 74, 210, 27),
+            if self.settings.winter_animation {
+                "Снег и сияние: вкл"
+            } else {
+                "Снег и сияние: выкл"
+            },
+            true,
+        );
+        self.winter.lights(dc, w);
         match self.page {
             0 => {
                 box_round(dc, rect(x, 124, width, 98), CARD, LINE, 14);
@@ -733,7 +949,7 @@ impl App {
                         if i == 0 {
                             "MTProto → WebSocket · Rust"
                         } else {
-                            "zapret · стратегии Flowseal"
+                            "Служба Windows · Flowseal"
                         },
                         rect(cx + 20, 307, cw - 30, 22),
                         13,
@@ -776,7 +992,7 @@ impl App {
                             dc,
                             &format!(
                                 "Профиль: {}",
-                                self.settings.strategy.trim_end_matches(".bat")
+                                relay::strategy_label(&self.settings.strategy)
                             ),
                             rect(cx + 20, 436, cw - 40, 22),
                             12,
@@ -936,7 +1152,7 @@ impl App {
                 );
                 text(
                     dc,
-                    "Начните с general. При проблемах попробуйте ALT.",
+                    "Выберите ALT. Для запуска используется служба Windows.",
                     rect(x + 20, 183, width - 40, 25),
                     13,
                     MUTED,
@@ -945,7 +1161,7 @@ impl App {
                 self.button(
                     20,
                     rect(x + 20, 223, 340, 38),
-                    &format!("{}  ▾", self.settings.strategy),
+                    &format!("{}  ▾", relay::strategy_label(&self.settings.strategy)),
                     idle && self.ready,
                 );
                 text(
@@ -956,8 +1172,11 @@ impl App {
                     TEXT,
                     DT_SINGLELINE,
                 );
-                MoveWindow(self.port_edit, x + 22, 325, 128, 30, 1);
-                EnableWindow(self.port_edit, if idle { 1 } else { 0 });
+                box_round(dc, rect(x + 20, 321, 138, 38), rgb(12, 27, 27), LINE, 8);
+                MoveWindow(self.port_edit, x + 30, 330, 118, 21, 1);
+                if (IsWindowEnabled(self.port_edit) != 0) != idle {
+                    EnableWindow(self.port_edit, if idle { 1 } else { 0 });
+                }
                 self.button(
                     21,
                     rect(x + 174, 321, 145, 38),
@@ -1120,6 +1339,67 @@ impl App {
                     "Бэкап hosts сохраняется в Relay_data. Список маршрутов встроен в exe; автоматических загрузок нет.",
                     rect(x, 635, width, 45),
                     12,
+                    MUTED,
+                    DT_WORDBREAK,
+                );
+            }
+            5 => {
+                box_round(dc, rect(x, 124, width, 230), CARD, LINE, 14);
+                text(
+                    dc,
+                    &format!("Установлена версия {}", env!("CARGO_PKG_VERSION")),
+                    rect(x + 20, 147, width - 40, 30),
+                    22,
+                    TEXT,
+                    DT_SINGLELINE,
+                );
+                text(
+                    dc,
+                    &self.update_status,
+                    rect(x + 20, 196, width - 40, 70),
+                    14,
+                    MUTED,
+                    DT_WORDBREAK,
+                );
+                self.button(
+                    81,
+                    rect(x + 20, 291, 185, 38),
+                    "Проверить сейчас",
+                    !self.update_busy,
+                );
+                self.button(
+                    83,
+                    rect(x + 221, 291, 250, 38),
+                    "Перезапустить и обновить",
+                    self.update_ready.is_some()
+                        && !self.startup_busy
+                        && !self.ai_busy
+                        && !self.busy.iter().any(|b| *b),
+                );
+                box_round(dc, rect(x, 375, width, 160), CARD, LINE, 14);
+                self.button(
+                    80,
+                    rect(x + 20, 399, 390, 38),
+                    if self.settings.auto_update {
+                        "✓  Скачивать новые релизы автоматически"
+                    } else {
+                        "○  Скачивать новые релизы автоматически"
+                    },
+                    true,
+                );
+                text(
+                    dc,
+                    "Проверка при запуске и каждые 30 минут. Скачивание идёт в фоне; перед установкой проверяются размер, Windows x64 и SHA-256 GitHub. Настройки сохраняются.",
+                    rect(x + 20, 457, width - 40, 63),
+                    14,
+                    MUTED,
+                    DT_WORDBREAK,
+                );
+                text(
+                    dc,
+                    "Для выпуска обновления: тег vX.Y.Z и файл Relay.exe в опубликованном релизе GitHub. Предварительные релизы тоже поддерживаются.",
+                    rect(x, 560, width, 70),
+                    13,
                     MUTED,
                     DT_WORDBREAK,
                 );
@@ -1313,7 +1593,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 PostMessageW(raw as HWND, WM_APP + 1, 0, 0);
             }));
             app.port_edit = CreateWindowExW(
-                WS_EX_CLIENTEDGE,
+                0,
                 wide("EDIT").as_ptr(),
                 wide(&app.settings.port.to_string()).as_ptr(),
                 WS_CHILD | WS_TABSTOP | ES_NUMBER as u32 | ES_AUTOHSCROLL as u32,
@@ -1326,13 +1606,30 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 GetModuleHandleW(null()),
                 null(),
             );
-            SendMessageW(
-                app.port_edit,
-                WM_SETFONT,
-                GetStockObject(DEFAULT_GUI_FONT) as usize,
-                1,
+            app.port_font = CreateFontW(
+                -15,
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as u32,
+                OUT_DEFAULT_PRECIS as u32,
+                CLIP_DEFAULT_PRECIS as u32,
+                CLEARTYPE_QUALITY as u32,
+                DEFAULT_PITCH as u32,
+                wide("Segoe UI").as_ptr(),
             );
+            SendMessageW(app.port_edit, WM_SETFONT, app.port_font as usize, 1);
             SetTimer(hwnd, 1, 500, None);
+            0
+        }
+        WM_TIMER if wp == 2 => {
+            if app.animation_timer {
+                InvalidateRect(hwnd, null(), 0);
+            }
             0
         }
         WM_TIMER => {
@@ -1354,6 +1651,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             app.show_window();
             0
         }
+        message if message == WM_APP + 4 => {
+            app.refresh_animation();
+            0
+        }
         WM_APP..=0xBFFF => {
             if app.drain() {
                 InvalidateRect(hwnd, null(), 0);
@@ -1365,21 +1666,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let dc = BeginPaint(hwnd, &mut ps);
             let mut r = RECT::default();
             GetClientRect(hwnd, &mut r);
-            let mem = CreateCompatibleDC(dc);
-            let bitmap = CreateCompatibleBitmap(dc, r.right.max(1), r.bottom.max(1));
-            let old = SelectObject(mem, bitmap);
+            if app
+                .surface
+                .as_ref()
+                .is_none_or(|s| s.width != r.right || s.height != r.bottom)
+            {
+                app.surface = crate::winter::Surface::new(dc, r.right, r.bottom);
+            }
+            let Some(surface) = app.surface.as_ref() else {
+                EndPaint(hwnd, &ps);
+                return 0;
+            };
+            let mem = surface.dc;
             app.draw(mem, r.right, r.bottom);
             BitBlt(dc, 0, 0, r.right, r.bottom, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, old);
-            DeleteObject(bitmap);
-            DeleteDC(mem);
             EndPaint(hwnd, &ps);
             0
         }
         WM_DRAWITEM => {
             let item = &*(lp as *const DRAWITEMSTRUCT);
             let id = item.CtlID;
-            let selected = (100..=105).contains(&id) && id - 100 == app.page as u32;
+            let selected = (100..=106).contains(&id) && id - 100 == app.page as u32;
             let primary = id == 1 || id == 21;
             let disabled = item.itemState & ODS_DISABLED != 0;
             let color = if primary {
@@ -1393,8 +1700,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Owner-drawn buttons still receive an erased rectangular surface.
             // Paint the parent colour before drawing the rounded silhouette.
             let background = match id {
-                100..=105 => PANEL,
-                1 | 10..=12 | 15..=16 | 20..=22 | 40..=41 | 50 | 60..=61 => CARD,
+                100..=106 => PANEL,
+                1 | 10..=12 | 15..=16 | 20..=22 | 40..=41 | 50 | 60..=61 | 80..=81 | 83 => CARD,
                 13 => {
                     if app.page == 0 {
                         rgb(45, 37, 24)
@@ -1468,6 +1775,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             0
         }
         WM_ERASEBKGND => 1,
+        WM_SHOWWINDOW | WM_ACTIVATE | WM_SETTINGCHANGE => {
+            PostMessageW(hwnd, WM_APP + 4, 0, 0);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_SIZE => {
             InvalidateRect(hwnd, null(), 0);
             0
@@ -1493,11 +1804,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_CTLCOLOREDIT => {
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC if lp as HWND == app.port_edit => {
             let dc = wp as HDC;
-            SetTextColor(dc, TEXT);
-            SetBkColor(dc, CARD);
-            SetDCBrushColor(dc, CARD);
+            SetTextColor(
+                dc,
+                if IsWindowEnabled(app.port_edit) != 0 {
+                    TEXT
+                } else {
+                    MUTED
+                },
+            );
+            SetBkColor(dc, rgb(12, 27, 27));
+            SetDCBrushColor(dc, rgb(12, 27, 27));
             GetStockObject(DC_BRUSH) as isize
         }
         WM_CLOSE => {
@@ -1517,6 +1835,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 InvalidateRect(hwnd, null(), 0);
                 return 0;
             }
+            if app.busy[1] {
+                app.show_window();
+                app.notify("Дождитесь запуска или остановки службы.".into(), true);
+                return 0;
+            }
+            if app.running[1] {
+                if app.send(Action::Stop(Kind::Zapret)) {
+                    app.close_after_service = true;
+                    app.busy[1] = true;
+                }
+                return 0;
+            }
             if app.ai_running {
                 if app.send(Action::Stop(Kind::Ai)) {
                     app.close_after_ai = true;
@@ -1524,13 +1854,29 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 return 0;
             }
+            if app.install_pending {
+                let result = app
+                    .update_ready
+                    .as_ref()
+                    .ok_or("Обновление не готово".to_string())
+                    .and_then(|d| relay::updates::install(d, &app.data));
+                if let Err(e) = result {
+                    app.install_pending = false;
+                    app.quitting = false;
+                    app.show_window();
+                    app.notify(e, true);
+                    return 0;
+                }
+            }
             DestroyWindow(hwnd);
             0
         }
         WM_DESTROY => {
+            DeleteObject(app.port_font);
             app.remove_tray();
             app.backend.take();
             KillTimer(hwnd, 1);
+            KillTimer(hwnd, 2);
             PostQuitMessage(0);
             0
         }
