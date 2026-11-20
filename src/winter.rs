@@ -90,7 +90,7 @@ impl Winter {
                 + ((seed * 137.0 + t * (2.0 + depth) + 8.0 * (t * 0.3 + seed).sin())
                     .rem_euclid((width - 210).max(1) as f32));
             let y = (seed * 91.0 + t * (8.0 + depth * 6.0)).rem_euclid(height.max(1) as f32);
-            let size = [3, 4, 6][i % 3];
+            let size = [1, 2, 2][i % 3];
             let old = SelectObject(dc, brushes[i % 3]);
             Ellipse(
                 dc,

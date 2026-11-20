@@ -599,7 +599,7 @@ impl App {
             && !self.quitting;
         self.winter.running(on);
         if on && !self.animation_timer {
-            SetTimer(self.hwnd, 2, 80, None);
+            SetTimer(self.hwnd, 2, 33, None);
             self.animation_timer = true;
         } else if !on && self.animation_timer {
             KillTimer(self.hwnd, 2);
