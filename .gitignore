@@ -1,0 +1,6 @@
+/target/
+/dist/
+/.build/
+/Relay_data/
+*.log
+config.json
