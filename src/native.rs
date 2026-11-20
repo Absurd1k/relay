@@ -373,7 +373,11 @@ impl App {
                         } => {
                             self.update_busy = true;
                             self.update_status =
-                                format!("Скачивается v{version} · {}%", bytes * 100 / total.max(1));
+                                if let Some(percent) = (bytes * 100).checked_div(total) {
+                                    format!("Скачивается v{version} · {percent}%")
+                                } else {
+                                    format!("Скачивается v{version} · {} КБ", bytes / 1024)
+                                };
                         }
                         Status::Ready(download) => {
                             self.update_busy = false;

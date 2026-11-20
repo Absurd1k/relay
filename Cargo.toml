@@ -1,6 +1,6 @@
 [package]
 name = "relay"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Portable Windows control panel for Telegram and zapret"
 license = "MIT"

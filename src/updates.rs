@@ -64,7 +64,7 @@ fn get(url: &str, limit: u64) -> Result<Vec<u8>, String> {
     let response = agent
         .get(url)
         .header("User-Agent", "Relay-Windows-Updater")
-        .header("Accept", "application/vnd.github+json")
+        .header("Accept", "application/atom+xml,text/plain,*/*")
         .call()
         .map_err(|e| e.to_string())?;
     let mut bytes = Vec::new();
@@ -78,6 +78,67 @@ fn get(url: &str, limit: u64) -> Result<Vec<u8>, String> {
         return Err("Слишком большой ответ GitHub".into());
     }
     Ok(bytes)
+}
+fn atom_releases(bytes: &[u8]) -> Result<Vec<Release>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "Некорректная кодировка ленты GitHub")?;
+    if !text.contains("<feed ") {
+        return Err("GitHub вернул некорректную ленту релизов".into());
+    }
+    let prefix = format!("href=\"https://github.com/{REPO}/releases/tag/");
+    let mut releases = vec![];
+    // GitHub escapes release-note HTML. Read only actual link elements, never titles/content.
+    for entry in text.split("<entry>").skip(1).take(50) {
+        let entry = entry.split("</entry>").next().unwrap_or("");
+        for link in entry.split("<link ").skip(1) {
+            let Some((attributes, _)) = link.split_once('>') else {
+                continue;
+            };
+            let Some((_, tail)) = attributes.split_once(&prefix) else {
+                continue;
+            };
+            let Some((tag, _)) = tail.split_once('"') else {
+                continue;
+            };
+            if version(tag).is_none()
+                || !tag
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b".-+".contains(&c))
+            {
+                continue;
+            }
+            releases.push(Release {
+                tag_name: tag.into(),
+                draft: false,
+                assets: vec![Asset {
+                    name: "Relay.exe".into(),
+                    browser_download_url: format!(
+                        "https://github.com/{REPO}/releases/download/{tag}/Relay.exe"
+                    ),
+                    size: 0,
+                    digest: None,
+                }],
+            });
+            break;
+        }
+    }
+    if releases.is_empty() {
+        return Err("В ленте GitHub нет поддерживаемых релизов".into());
+    }
+    Ok(releases)
+}
+fn checksum(bytes: &[u8]) -> Result<String, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "Некорректный файл SHA256SUMS.txt")?;
+    let mut found = None;
+    for line in text.lines() {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() == 2 && fields[1].trim_start_matches('*') == "Relay.exe" {
+            if !valid_hash(fields[0]) || found.is_some() {
+                return Err("Некорректная или повторная контрольная сумма Relay.exe".into());
+            }
+            found = Some(fields[0].to_ascii_lowercase());
+        }
+    }
+    found.ok_or_else(|| "В релизе нет контрольной суммы Relay.exe".into())
 }
 fn valid_hash(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
@@ -139,6 +200,14 @@ fn cached(data: &Path) -> Option<Download> {
     Some(d)
 }
 pub fn check(data: &Path, force: bool, emit: impl Fn(Status)) -> Result<(), String> {
+    check_for_version(data, force, env!("CARGO_PKG_VERSION"), emit)
+}
+fn check_for_version(
+    data: &Path,
+    force: bool,
+    current: &str,
+    emit: impl Fn(Status),
+) -> Result<(), String> {
     if let Some(d) = cached(data) {
         emit(Status::Ready(d));
         return Ok(());
@@ -157,14 +226,13 @@ pub fn check(data: &Path, force: bool, emit: impl Fn(Status)) -> Result<(), Stri
         return Ok(());
     }
     emit(Status::Checking);
-    let releases: Vec<Release> = serde_json::from_slice(&get(
-        &format!("https://api.github.com/repos/{REPO}/releases?per_page=20"),
+    let releases = atom_releases(&get(
+        &format!("https://github.com/{REPO}/releases.atom"),
         1024 * 1024,
-    )?)
-    .map_err(|e| e.to_string())?;
+    )?)?;
     std::fs::create_dir_all(stamp.parent().unwrap()).map_err(|e| e.to_string())?;
     std::fs::write(&stamp, now.to_string()).map_err(|e| e.to_string())?;
-    let Some(release) = select(releases, env!("CARGO_PKG_VERSION")) else {
+    let Some(release) = select(releases, current) else {
         emit(Status::Current);
         return Ok(());
     };
@@ -185,16 +253,19 @@ pub fn check(data: &Path, force: bool, emit: impl Fn(Status)) -> Result<(), Stri
         "https://github.com/{REPO}/releases/download/{}/Relay.exe",
         release.tag_name
     );
-    if asset.browser_download_url != expected || asset.size < 512 || asset.size > MAX_EXE {
+    if asset.browser_download_url != expected
+        || (asset.size != 0 && asset.size < 512)
+        || asset.size > MAX_EXE
+    {
         return Err("Недопустимый адрес или размер обновления".into());
     }
-    let hash = asset
-        .digest
-        .as_deref()
-        .and_then(|s| s.strip_prefix("sha256:"))
-        .filter(|s| valid_hash(s))
-        .ok_or("GitHub ещё не предоставил SHA-256 файла. Повторите проверку позже.")?
-        .to_ascii_lowercase();
+    let hash = checksum(&get(
+        &format!(
+            "https://github.com/{REPO}/releases/download/{}/SHA256SUMS.txt",
+            release.tag_name
+        ),
+        64 * 1024,
+    )?)?;
     let dir = data.join("updates").join(ver.to_string());
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let temp = dir.join("Relay.exe.part");
@@ -213,7 +284,16 @@ pub fn check(data: &Path, force: bool, emit: impl Fn(Status)) -> Result<(), Stri
         .header("User-Agent", "Relay-Windows-Updater")
         .call()
         .map_err(|e| e.to_string())?;
-    let mut reader = response.into_body().into_reader().take(asset.size + 1);
+    let expected_size = response
+        .headers()
+        .get("content-length")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    if expected_size.is_some_and(|n| !(512..=MAX_EXE).contains(&n)) {
+        return Err("Недопустимый размер обновления".into());
+    }
+    let limit = expected_size.unwrap_or(MAX_EXE);
+    let mut reader = response.into_body().into_reader().take(limit + 1);
     let mut file = std::fs::File::create(&temp).map_err(|e| e.to_string())?;
     let mut buffer = [0u8; 32768];
     let mut size = 0u64;
@@ -224,7 +304,7 @@ pub fn check(data: &Path, force: bool, emit: impl Fn(Status)) -> Result<(), Stri
             break;
         }
         size += n as u64;
-        if size > asset.size {
+        if size > limit {
             return Err("Размер скачанного обновления превышен".into());
         }
         file.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
@@ -232,7 +312,7 @@ pub fn check(data: &Path, force: bool, emit: impl Fn(Status)) -> Result<(), Stri
             emit(Status::Downloading {
                 version: ver.to_string(),
                 bytes: size,
-                total: asset.size,
+                total: expected_size.unwrap_or(0),
             });
             last_progress = std::time::Instant::now();
         }
@@ -243,8 +323,11 @@ pub fn check(data: &Path, force: bool, emit: impl Fn(Status)) -> Result<(), Stri
         version: ver.to_string(),
         path: temp,
         sha256: hash,
-        size: asset.size,
+        size,
     };
+    if size < 512 || expected_size.is_some_and(|n| n != size) {
+        return Err("Обновление скачано не полностью".into());
+    }
     verify_download(&d)?;
     std::fs::rename(&d.path, &final_path).map_err(|e| e.to_string())?;
     d.path = final_path;
@@ -328,6 +411,46 @@ pub fn install(d: &Download, data: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn atom_links_and_checksum_are_restricted_to_our_release_asset() {
+        let atom=br#"<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>v99.0.0</title><link href="https://evil.example/releases/tag/v99.0.0"/><link href="https://github.com/Absurd1k/relay/releases/tag/v0.2.1"/></entry><entry><link href="https://github.com/Absurd1k/relay/releases/tag/../../bad"/></entry></feed>"#;
+        let releases = atom_releases(atom).unwrap();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0].tag_name, "v0.2.1");
+        let hash = "a".repeat(64);
+        assert_eq!(
+            checksum(
+                format!("{}  Other.exe\r\n{} *Relay.exe\r\n", "b".repeat(64), hash).as_bytes()
+            )
+            .unwrap(),
+            hash
+        );
+        assert!(checksum(b"bad  Relay.exe").is_err());
+        assert!(checksum(format!("{hash} Relay.exe\n{hash} Relay.exe").as_bytes()).is_err());
+    }
+    #[test]
+    #[ignore = "downloads a public release from GitHub; never executes it"]
+    fn live_github_download_verifies_public_release_without_api() {
+        let dir = std::env::temp_dir().join(format!(
+            "relay-live-update-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ready = std::sync::Mutex::new(None);
+        check_for_version(&dir, true, "0.0.0", |s| {
+            if let Status::Ready(d) = s {
+                *ready.lock().unwrap() = Some(d);
+            }
+        })
+        .unwrap();
+        let download = ready.into_inner().unwrap().expect("published release");
+        verify_download(&download).unwrap();
+        assert!(download.size >= 512);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     fn downloaded_executable_rejects_tampering_and_wrong_architecture() {
         let dir = std::env::temp_dir().join(format!("relay-update-test-{}", std::process::id()));
